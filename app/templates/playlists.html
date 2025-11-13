@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="container-fluid p-lg-5 text-light">
+
+  <div class="d-flex flex-wrap gap-2 align-items-end mb-3">
+    <div>
+      <h4 class="mb-1">Per-Portal M3U</h4>
+      <small class="text-muted">Portal wählen, M3U ansehen oder herunterladen</small>
+    </div>
+    <a class="btn btn-warning ms-auto" href="/playlist.m3u">
+      <i class="fa fa-download"></i> Download All (M3U)
+    </a>
+    <a class="btn btn-info" href="/xmltv.xml">
+      <i class="fa fa-download"></i> Download XMLTV
+    </a>
+  </div>
+
+  <div class="card text-dark bg-light mb-4">
+    <div class="card-body">
+      <div class="row g-2 align-items-end">
+        <div class="col-sm-6 col-md-4">
+          <label class="form-label fw-bold">Portal</label>
+          <select id="portalSelect" class="form-select">
+            <option value="">— auswählen —</option>
+            {% for portal_id, portal in portals.items() if portal.enabled == 'true' %}
+              <option value="{{ portal_id }}">{{ portal.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col d-flex gap-2">
+          <a id="btnViewRaw" class="btn btn-primary" target="_blank" hidden>
+            <i class="fa fa-eye"></i> Raw öffnen
+          </a>
+          <a id="btnDownload" class="btn btn-success" hidden>
+            <i class="fa fa-download"></i> Download M3U
+          </a>
+        </div>
+      </div>
+
+      <div class="mt-3">
+        <label class="form-label fw-bold">Vorschau</label>
+        <pre id="m3uOut" class="border p-3 bg-white" style="white-space: pre-wrap; min-height: 240px; max-height: 60vh; overflow:auto;">Bitte Portal wählen…</pre>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  const sel = document.getElementById('portalSelect');
+  const out = document.getElementById('m3uOut');
+  const btnView = document.getElementById('btnViewRaw');
+  const btnDl  = document.getElementById('btnDownload');
+
+  async function loadM3U(id) {
+    out.textContent = 'Lade M3U …';
+    try {
+      const res = await fetch(`/playlist/${id}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const txt = await res.text();
+      out.textContent = txt;
+    } catch (e) {
+      out.textContent = 'Fehler beim Laden: ' + (e?.message || e);
+    }
+  }
+
+  sel.addEventListener('change', () => {
+    const id = sel.value;
+    if (!id) {
+      out.textContent = 'Bitte Portal wählen…';
+      btnView.hidden = true;
+      btnDl.hidden = true;
+      return;
+    }
+    btnView.href = `/playlist/${id}`;
+    btnDl.href   = `/playlist/${id}.m3u`;
+    btnView.hidden = false;
+    btnDl.hidden =  false;
+    loadM3U(id);
+  });
+</script>
+
+{% endblock %}
