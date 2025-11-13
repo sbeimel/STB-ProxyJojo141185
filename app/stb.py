@@ -8,6 +8,59 @@ retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 50
 s.mount("http://", HTTPAdapter(max_retries=retries))
 
 
+# === [ADDED] MAC utilities and portal validation ===
+import time
+
+MAC_REGEX = re.compile(r"^[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
+
+def normalize_mac(mac: str) -> str:
+    if not isinstance(mac, str):
+        return ""
+    # Remove non-hex characters and uppercase
+    hexchars = re.sub(r"[^0-9A-Fa-f]", "", mac)
+    if len(hexchars) != 12:
+        return ""
+    pairs = [hexchars[i:i+2].upper() for i in range(0, 12, 2)]
+    return ":".join(pairs)
+
+def is_valid_mac(mac: str) -> bool:
+    return bool(MAC_REGEX.match(mac))
+
+def validate_portal_url(url: str, proxy: str=None, t_zone: str=None, timeout: int=8) -> tuple:
+    """Validate portal PHP endpoint reachability:
+    - Requires .php URL
+    - Tries handshake; if token present -> strong OK
+    Returns (ok: bool, message: str).
+    """
+    if not url or not url.endswith(".php"):
+        return False, "URL must end with .php"
+    proxies = {"http": proxy, "https": proxy}
+    headers = {"User-Agent": "Mozilla/5.0 (QtEmbedded; U; Linux; C)"}
+    cookies = {"mac": "00:1A:79:00:00:01", "stb_lang": "en", "timezone": (t_zone or "UTC")}
+    try:
+        r = s.get(
+            url,
+            headers=headers,
+            cookies=cookies,
+            params={"type":"stb","action":"handshake","JsHttpRequest":"1-xml"},
+            proxies=proxies,
+            timeout=timeout
+        )
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}"
+        try:
+            j = r.json()
+            if isinstance(j, dict) and "js" in j and "token" in j.get("js", {}):
+                return True, "handshake ok"
+        except Exception:
+            pass
+        return True, "reachable"
+    except Exception as e:
+        return False, f"error: {type(e).__name__}"
+
+
+
+
 def getUrl(url, proxy=None):
     def parseResponse(url, data):
         java = data.text.replace(" ", "").replace("'", "").replace("+", "")
@@ -42,7 +95,7 @@ def getUrl(url, proxy=None):
     try:
         for i in urls:
             try:
-                response = s.get(url + i, headers=headers, proxies=proxies)
+                response = s.get(url + i, headers=headers, proxies=proxies, timeout=10)
             except:
                 response = None
             if response:
@@ -54,7 +107,7 @@ def getUrl(url, proxy=None):
     try:
         for i in urls:
             try:
-                response = s.get(url + i, headers=headers)
+                response = s.get(url + i, headers=headers, timeout=10)
             except:
                 response = None
             if response:
@@ -72,8 +125,7 @@ def getToken(url, mac, proxy=None, t_zone=None):
             url + "?type=stb&action=handshake&JsHttpRequest=1-xml",
             cookies=cookies,
             headers=headers,
-            proxies=proxies,
-        )
+            proxies=proxies, timeout=10)
         token = response.json()["js"]["token"]
         if token:
             return token
@@ -93,8 +145,7 @@ def getProfile(url, mac, token, proxy=None, t_zone=None):
             url + "?type=stb&action=get_profile&JsHttpRequest=1-xml",
             cookies=cookies,
             headers=headers,
-            proxies=proxies,
-        )
+            proxies=proxies, timeout=10)
         profile = response.json()["js"]
         if profile:
             return profile
@@ -114,8 +165,7 @@ def getExpires(url, mac, token, proxy=None, t_zone=None):
             url + "?type=account_info&action=get_main_info&JsHttpRequest=1-xml",
             cookies=cookies,
             headers=headers,
-            proxies=proxies,
-        )
+            proxies=proxies, timeout=10)
         expires = response.json()["js"]["phone"]
         if expires:
             return expires
@@ -136,8 +186,7 @@ def getAllChannels(url, mac, token, proxy=None, t_zone=None):
             + "?type=itv&action=get_all_channels&force_ch_link_check=&JsHttpRequest=1-xml",
             cookies=cookies,
             headers=headers,
-            proxies=proxies,
-        )
+            proxies=proxies, timeout=10)
         channels = response.json()["js"]["data"]
         if channels:
             return channels
@@ -157,8 +206,7 @@ def getGenres(url, mac, token, proxy=None, t_zone=None):
             url + "?action=get_genres&type=itv&JsHttpRequest=1-xml",
             cookies=cookies,
             headers=headers,
-            proxies=proxies,
-        )
+            proxies=proxies, timeout=10)
         genreData = response.json()["js"]
         if genreData:
             return genreData
@@ -195,14 +243,14 @@ def getLink(url, mac, token, cmd, proxy=None, t_zone=None):
             + "&series=0&forced_storage=false&disable_ad=false&download=false&force_ch_link_check=false&JsHttpRequest=1-xml",
             cookies=cookies,
             headers=headers,
-            proxies=proxies,
-        )
+            proxies=proxies, timeout=10)
         data = response.json()
         link = data["js"]["cmd"].split()[-1]
         if link:
             return link
     except:
         pass
+
 
 
 def getEpg(url, mac, token, period, proxy=None, t_zone=None):
@@ -214,13 +262,11 @@ def getEpg(url, mac, token, period, proxy=None, t_zone=None):
     }
     try:
         response = s.get(
-            url
-            + "?type=itv&action=get_epg_info&period="
-            + str(period)
-            + "&JsHttpRequest=1-xml",
+            url + "?type=itv&action=get_epg_info&period=" + str(period) + "&JsHttpRequest=1-xml",
             cookies=cookies,
             headers=headers,
             proxies=proxies,
+            timeout=10
         )
         data = response.json()["js"]["data"]
         if data:
