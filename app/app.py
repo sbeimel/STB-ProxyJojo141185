@@ -28,28 +28,16 @@ import secrets
 import waitress
 from collections import defaultdict
 import copy
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Lock for multi-threading  
 lock = threading.Lock()
-from collections import defaultdict as _dd
-portal_locks = _dd(threading.Lock)  # one lock per portal (by name)
 
 app = Flask(__name__)
 app.secret_key = secrets.token_urlsafe(32)
 
-
-# ==== Core paths & logging setup ====
-import os
-CONFIG_DIR = "/config/cache"
-DIRECT_STREAM_REDIRECT = False
-os.makedirs(CONFIG_DIR, exist_ok=True)
-LOG_PATH = os.path.join(CONFIG_DIR, "STB-Proxy.log")
-
-
 logger = logging.getLogger("STB-Proxy")
 logFormat = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-fileHandler = logging.FileHandler(LOG_PATH)
+fileHandler = logging.FileHandler("STB-Proxy.log")
 fileHandler.setFormatter(logFormat)
 logger.addHandler(fileHandler)
 consoleFormat = logging.Formatter("[%(levelname)s] %(message)s")
@@ -57,127 +45,6 @@ consoleHandler = logging.StreamHandler()
 consoleHandler.setFormatter(consoleFormat)
 logger.addHandler(consoleHandler)
 
-# --- Simple in-memory cache for portal channel/genre lookups ---
-from time import time as _now
-CHANNEL_CACHE = {}  # { portal_id: {"ts": float, "channels": [...], "genres": {...}} }
-
-
-# --- Persist channel cache to disk (optional, for debugging/export) ---
-def _channels_cache_dir():
-    import os
-    d = os.path.join(CONFIG_DIR, 'cache')
-    os.makedirs(d, exist_ok=True)
-    return d
-
-def save_channels_json(portal_id, channels, genres=None):
-    try:
-        d = _channels_cache_dir()
-        path = os.path.join(d, f"{portal_id}_channels.json")
-        data = {"portal_id": portal_id, "channels": channels or [], "genres": genres or {}}
-        import json
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as e:
-        try:
-            with open('stb.log','a',encoding='utf-8') as fh:
-                fh.write(f"[WARNING] Could not save channel cache for {portal_id}: {type(e).__name__}\n")
-        except Exception:
-            pass
-        return False
-
-CACHE_TTL = 60.0    # seconds
-cache_lock = threading.Lock()
-
-def get_portal_channels_genres(portal_id, portal_data):
-    """
-    Returns (all_channels, genres) for a portal with short-lived caching.
-    all_channels: list of channel dicts (as returned by stb.getAllChannels)
-    genres: dict {genre_id: genre_name}
-    """
-    # cache hit?
-    with cache_lock:
-        item = CHANNEL_CACHE.get(portal_id)
-        if item and (_now() - item["ts"] <= CACHE_TTL):
-            return item["channels"], item["genres"]
-
-    # miss -> fetch
-    url = portal_data.get("url")
-    proxy = portal_data.get("proxy")
-    time_zone = portal_data.get("time_zone")
-    macs = list(portal_data.get("macs", {}).keys())
-
-    all_channels, genres = None, None
-    for mac in macs:
-        try:
-            token = stb.getToken(url, mac, proxy, time_zone)
-            stb.getProfile(url, mac, token, proxy, time_zone)
-            all_channels = stb.getAllChannels(url, mac, token, proxy, time_zone)
-            genres = stb.getGenreNames(url, mac, token, proxy, time_zone)
-            if all_channels and genres:
-                break
-        except Exception as e:
-            logger.debug(f"Channel/Genre fetch failed for MAC {mac}: {e}")
-            continue
-
-    if all_channels and genres:
-        with cache_lock:
-            CHANNEL_CACHE[portal_id] = {
-                "ts": _now(),
-                "channels": all_channels,
-                "genres": genres,
-            }
-    try:
-        save_channels_json(portal_id, all_channels, genres)
-    except Exception:
-        pass
-    return all_channels, genres
-
-
-# --- Simple in-memory EPG cache (per portal, TTL) ---
-EPG_CACHE = {}   # { portal_id: {"ts": float, "epg": {channelId: [..]}} }
-EPG_TTL = 60.0   # seconds
-epg_lock = threading.Lock()
-
-def get_portal_epg(portal_id, portal_data, period_hours=24):
-    """Return EPG (dict channelId->list[programme]) with short-lived caching."""
-    with epg_lock:
-        item = EPG_CACHE.get(portal_id)
-        if item and (_now() - item["ts"] <= EPG_TTL):
-            return item["epg"]
-
-    url = portal_data.get("url")
-    proxy = portal_data.get("proxy")
-    time_zone = portal_data.get("time_zone")
-    macs = list(portal_data.get("macs", {}).keys())
-
-    epg = None
-    for mac in macs:
-        try:
-            token = stb.getToken(url, mac, proxy, time_zone)
-            stb.getProfile(url, mac, token, proxy, time_zone)
-            epg = stb.getEpg(url, mac, token, period_hours, proxy, time_zone)
-            if epg:
-                break
-        except Exception as e:
-            logger.debug(f"EPG fetch failed for MAC {mac}: {e}")
-            continue
-
-    if epg:
-        with epg_lock:
-            EPG_CACHE[portal_id] = {"ts": _now(), "epg": epg}
-    return epg or {}
-
-
-
-# --- Central config directory ---
-CONFIG_DIR = os.getenv('CONFIG_DIR', '/config')
-try:
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-except Exception:
-    # fallback to local folder if /config not writable
-    CONFIG_DIR = os.path.join(os.path.abspath(os.getcwd()), 'config')
-    os.makedirs(CONFIG_DIR, exist_ok=True)
 basePath = os.path.abspath(os.getcwd())
 
 if os.getenv("HOST"):
@@ -185,10 +52,10 @@ if os.getenv("HOST"):
 else:
     host = "localhost:8001"
 
-if os.getenv('CONFIG'):
-    configFile = os.getenv('CONFIG')
+if os.getenv("CONFIG"):
+    configFile = os.getenv("CONFIG")
 else:
-    configFile = os.path.join(CONFIG_DIR, 'config.json')
+    configFile = os.path.join(basePath, "config.json")
     
 if os.getenv("DEBUG_MODE"):
     debug_str = os.getenv("DEBUG_MODE")
@@ -353,22 +220,6 @@ def getPortals():
     return config["portals"]
 
 
-
-
-def getActivePortals():
-    """Return only portals with enabled == \'true\' (string or bool)."""
-    portals = getPortals()
-    active = {}
-    for pid, pdata in portals.items():
-        val = pdata.get("enabled")
-        if isinstance(val, bool):
-            is_active = val
-        else:
-            is_active = str(val).lower() == "true"
-        if is_active:
-            active[pid] = pdata
-    return active
-
 def savePortals(portals):
     with open(configFile, "w") as f:
         config["portals"] = portals
@@ -377,62 +228,6 @@ def savePortals(portals):
 
 def getSettings():
     return config["settings"]
-
-
-def _build_playlist_for_portal(portal_id, portal_data):
-    """Return list of #EXTINF entries for one portal; group-title uses portal name."""
-    entries = []
-    if portal_data.get("enabled") != "true":
-        return entries
-
-    enabled_channels = portal_data.get("enabled channels", [])
-    if not enabled_channels:
-        return entries
-
-    name = portal_data.get("name")
-    url = portal_data.get("url")
-    macs = list(portal_data.get("macs", {}).keys())
-    proxy = portal_data.get("proxy")
-    time_zone = portal_data.get("time_zone")
-
-    custom_channel_names   = portal_data.get("custom channel names", {})
-    custom_channel_numbers = portal_data.get("custom channel numbers", {})
-    custom_epg_ids         = portal_data.get("custom epg ids", {})
-
-    # Use cached channels
-    all_channels, _genres = get_portal_channels_genres(portal_id, portal_data)
-    if not all_channels:
-        return entries
-
-    use_channel_numbers = getSettings().get("use channel numbers", "true") == "true"
-    use_channel_genres  = getSettings().get("use channel genres",  "true") == "true"
-
-    for ch in all_channels:
-        channel_id = str(ch.get("id"))
-        if channel_id not in enabled_channels:
-            continue
-
-        channel_name   = custom_channel_names.get(channel_id) or ch.get("name")
-        channel_number = custom_channel_numbers.get(channel_id, ch.get("number"))
-        epg_id         = custom_epg_ids.get(channel_id, f"{portal_id}{channel_id}")
-        logo_url       = ch.get("logo")
-
-        # Build EXTINF header parts
-        parts = [f'#EXTINF:-1 tvg-id="{epg_id}"']
-        if use_channel_numbers and channel_number:
-            parts.append(f'tvg-chno="{channel_number}"')
-        if logo_url:
-            parts.append(f'tvg-logo="{logo_url}"')
-        if use_channel_genres:
-            # Requirement: use portal name for group-title
-            parts.append(f'group-title="{name}"')
-
-        header = " ".join(parts)
-        line = f'{header}, {channel_name}\nhttp://{host}/play/{portal_id}/{channel_id}'
-        entries.append(line)
-
-    return entries
-
 
 
 def saveSettings(settings):
@@ -477,53 +272,35 @@ def moveMac(portalId, mac):
     savePortals(portals)
 
 
-
-
 def test_mac_addresses(url, proxy, macs, name, time_zone):
-    """Sequentially test MAC addresses for a single portal (strictly one-at-a-time).
-    Returns (valid_macs, dead_macs) where:
-      valid_macs = [{ "mac": str, "expiry": <timestamp or None> }]
-      dead_macs  = [{ "mac": str, "reason": str }]
+    """
+    Tests a list of MAC addresses, returns the valid MACs and dead MACs.
     """
     dead_macs = []
     valid_macs = []
+    url=stb.getUrl(url)
 
-    # Resolve URL if needed
-    url = stb.getUrl(url, proxy) if not url.endswith(".php") else url
-
-    # Normalize & deduplicate
-    norm = []
-    seen = set()
-    for m in macs or []:
-        nm = stb.normalize_mac(m)
-        if not nm or not stb.is_valid_mac(nm):
-            dead_macs.append({ "mac": m, "reason": "invalid format" })
-            continue
-        if nm in seen:
-            continue
-        seen.add(nm)
-        norm.append(nm)
-
-    # Per-portal critical section: strictly one checker active for this portal name
-    with portal_locks[name]:
-        for mac in norm:
-            try:
-                token = stb.getToken(url, mac, proxy, time_zone)
-                if not token:
-                    dead_macs.append({ "mac": mac, "reason": "no token" })
-                    continue
-                stb.getProfile(url, mac, token, proxy, time_zone)
-                expiry = stb.getExpires(url, mac, token, proxy, time_zone)
-                if not expiry:
-                    dead_macs.append({ "mac": mac, "reason": "no expiry" })
-                    continue
-                valid_macs.append({ "mac": mac, "expiry": parseExpieryStr(expiry) })
-            except Exception as e:
-                dead_macs.append({ "mac": mac, "reason": f"error: {type(e).__name__}" })
+    for mac in macs:
+        mac_test_success = False
+        token = stb.getToken(url, mac, proxy, time_zone)
+        if token:
+            stb.getProfile(url, mac, token, proxy, time_zone)
+            expiry = stb.getExpires(url, mac, token, proxy, time_zone)
+            if expiry:
+                mac_test_success = True
+                logger.info(f"Successfully tested MAC({mac}) for Portal({name})")
+                valid_macs.append({
+                    "mac": mac,
+                    "expiry": parseExpieryStr(expiry),
+                })
+            else:
+                logger.error(f"Error retrieving expiry for MAC({mac}) in Portal({name})")
+        if not mac_test_success:
+            logger.error(f"Error testing MAC({mac}) for Portal({name})")
+            flash(f"Error testing MAC({mac}) for Portal({name})", "danger")
+            dead_macs.append(mac)
 
     return valid_macs, dead_macs
-
-
 
 
 def portal_update_macs(portal, macs=None, retest=False):
@@ -822,10 +599,6 @@ def portals_add():
             error_message = f"Error getting URL for Portal({name})"
             logger.error(error_message)
             return jsonify({"error": error_message}), 400
-    ok, msg = stb.validate_portal_url(url, proxy, time_zone)
-    # Do not block on non-200; only log
-    if not ok:
-        logger.warning(f"Portal validation warning for {name}: {msg}")
 
     # Create new Portal
     portal = {
@@ -863,29 +636,32 @@ def portals_add():
 @app.route("/portal/checkmacs", methods=["POST"])
 @authorise
 def portal_checkmacs():
-    if not request.is_json:
+    if request.is_json:
+        # Handling the JSON (AJAX) request
+        data = request.get_json()
+        id = data.get("id")
+        name = data.get("name")
+        url = data.get("url")
+        proxy = data.get("proxy")
+        time_zone = data.get("time_zone")
+
+        new_macs = data.get("macs")
+
+        # Validate and retrieve the URL
+        if not url.endswith(".php"):
+            url = stb.getUrl(url, proxy)
+            if not url:
+                return jsonify({"error": "Invalid URL"}), 400
+
+        # Test MAC addresses
+        valid_macs, dead_macs = test_mac_addresses(url, proxy, new_macs, name, time_zone)
+
+        # Return the tested MACs in JSON format
+        return jsonify({"validMacs": valid_macs})
+    else:
+        # Show message if the request is not JSON
         return jsonify({"error": "Invalid request"}), 400
 
-    data = request.get_json()
-    name = data.get("name")
-    url = data.get("url")
-    proxy = data.get("proxy")
-    time_zone = data.get("time_zone")
-    new_macs = data.get("macs") or []
-
-    # Validate/resolve URL
-    if not url.endswith(".php"):
-        url = stb.getUrl(url, proxy)
-        if not url:
-            return jsonify({"error": "Invalid URL"}), 400
-
-    ok, msg = stb.validate_portal_url(url, proxy, time_zone)
-    if not ok:
-        logger.warning(f"Portal validation warning for {name}: {msg}")
-
-    # Always test the MACs; warnings above are non-blocking
-    valid_macs, dead_macs = test_mac_addresses(url, proxy, new_macs, name, time_zone)
-    return jsonify({"validMacs": valid_macs, "deadMacs": dead_macs}), 200
 
 @app.route("/portal/addmacs", methods=["POST"])
 @authorise
@@ -1014,7 +790,16 @@ def editor_data():
             customEpgIds = portals[portal].get("custom epg ids", {})
             fallbackChannels = portals[portal].get("fallback channels", {})
 
-            allChannels, genres = get_portal_channels_genres(portal, portals[portal])
+            for mac in macs:
+                try:
+                    token = stb.getToken(url, mac, proxy, time_zone)
+                    stb.getProfile(url, mac, token, proxy, time_zone)
+                    allChannels = stb.getAllChannels(url, mac, token, proxy, time_zone)
+                    genres = stb.getGenreNames(url, mac, token, proxy, time_zone)
+                    break
+                except:
+                    allChannels = None
+                    genres = None
 
             if allChannels and genres:
                 for channel in allChannels:
@@ -1199,106 +984,196 @@ def save():
     return redirect("/settings", code=302)
 
 
-
 @app.route("/playlist", methods=["GET"])
 @authorise
 def playlist():
-    # If DIRECT_STREAM_REDIRECT is enabled and we resolved a real stream URL, redirect the client
-    try:
-        real_candidates = []
-        for vname in ('real_url','stream_url','link','playUrl','url'):
-            if vname in locals() and isinstance(locals()[vname], str) and locals()[vname].startswith('http'):
-                real_candidates.append(locals()[vname])
-        real_url = real_candidates[0] if real_candidates else None
-        if DIRECT_STREAM_REDIRECT and real_url:
-            return redirect(real_url, code=302)
-    except Exception:
-        pass
+    # Initialize the list to store channel information
     channels = []
     portals = getPortals()
-    for portal_id, portal_data in portals.items():
-        if portal_data.get("enabled") != "true":
-            continue
-        if not portal_data.get("enabled channels"):
-            continue
-        channels.extend(_build_playlist_for_portal(portal_id, portal_data))
 
-    playlist_text = "#EXTM3U\n" + "\n".join(channels)
-    if request.args.get("download") == "1":
-        resp = make_response(playlist_text)
-        resp.headers["Content-Type"] = "audio/x-mpegurl"
-        resp.headers["Content-Disposition"] = 'attachment; filename="all-portals.m3u"'
-        return resp
+    # Iterate over all portals
+    for portal_name, portal_data in portals.items():
+        if portal_data["enabled"] != "true":
+            continue
 
-    return Response(playlist_text, mimetype="text/plain")
+        enabled_channels = portal_data.get("enabled channels", [])
+        if not enabled_channels:
+            continue
+
+        # Extract portal-specific settings
+        name = portal_data["name"]
+        url = portal_data["url"]
+        macs = list(portal_data["macs"].keys())
+        proxy = portal_data["proxy"]
+        time_zone = portal_data["time_zone"]
+        custom_channel_names = portal_data.get("custom channel names", {})
+        custom_genres = portal_data.get("custom genres", {})
+        custom_channel_numbers = portal_data.get("custom channel numbers", {})
+        custom_epg_ids = portal_data.get("custom epg ids", {})
+
+        # Retrieve channel and genre data for the first valid MAC
+        all_channels, genres = None, None
+        for mac in macs:
+            try:
+                token = stb.getToken(url, mac, proxy, time_zone)
+                stb.getProfile(url, mac, token, proxy, time_zone)
+                all_channels = stb.getAllChannels(url, mac, token, proxy, time_zone)
+                genres = stb.getGenreNames(url, mac, token, proxy, time_zone)
+                break  # Exit the loop if data retrieval succeeds
+            except Exception as e:
+                logger.warning(f"Failed to retrieve data for MAC {mac}: {e}")
+                continue
+
+        # Skip processing if channel or genre data is unavailable
+        if not all_channels or not genres:
+            logger.error(f"Error making playlist for {name}, skipping")
+            continue
+
+        # Process each channel in the portal
+        for channel in all_channels:
+            channel_id = str(channel.get("id"))
+            if channel_id not in enabled_channels:
+                continue
+
+            # Retrieve channel attributes with fallbacks
+            channel_name = custom_channel_names.get(channel_id, channel.get("name"))
+            genre_id = str(channel.get("tv_genre_id"))
+            genre = custom_genres.get(channel_id, genres.get(genre_id))
+            channel_number = custom_channel_numbers.get(channel_id, channel.get("number"))
+            epg_id = custom_epg_ids.get(channel_id, f"{portal_name}{channel_id}")
+            logo_url = channel.get("logo")
+
+            # Build the playlist entry
+            use_channel_numbers = getSettings().get("use channel numbers", "true") == "true"
+            use_channel_genres = getSettings().get("use channel genres", "true") == "true"
+
+            entry = (
+                f"#EXTINF:-1 tvg-id=\"{epg_id}\""
+                + (f' tvg-chno="{channel_number}"' if use_channel_numbers and channel_number else "")
+                + (f' tvg-logo="{logo_url}"' if logo_url else "")
+                + (f' group-title="{genre}"' if use_channel_genres and genre else "")
+                + f', {channel_name}\nhttp://{host}/play/{portal_name}/{channel_id}'
+            )
+            channels.append(entry)
+
+    # Sort the playlist based on user settings
+    if getSettings().get("sort playlist by channel name", "true") == "true":
+        channels.sort(key=lambda x: x.split(",")[1].split("\n")[0])
+    if getSettings().get("use channel numbers", "true") == "true" and \
+       getSettings().get("sort playlist by channel number", "false") == "true":
+        channels.sort(key=lambda x: x.split('tvg-chno="')[1].split('"')[0])
+    if getSettings().get("use channel genres", "true") == "true" and \
+       getSettings().get("sort playlist by channel genre", "false") == "true":
+        channels.sort(key=lambda x: x.split('group-title="')[1].split('"')[0])
+
+    # Combine all channels into a single playlist
+    playlist = "#EXTM3U\n" + "\n".join(channels)
+
+    # Return the playlist as a plain text response
+    return Response(playlist, mimetype="text/plain")
+
 
 
 @app.route("/xmltv", methods=["GET"])
 @authorise
 def xmltv():
+    
     def float_to_time_stamp(decimal_hours):
         hours = int(decimal_hours)
         minutes = int((decimal_hours - hours) * 60)
+        
         sign = '+' if hours >= 0 else '-'
         hours = abs(hours)
+        
         return f"{sign}{hours:02d}{minutes:02d}"
-
+    
     channels = ET.Element("tv")
     programmes = ET.Element("tv")
     portals = getPortals()
-    for portal_id, portal in portals.items():
-        if portal.get("enabled") != "true":
-            continue
-        enabledChannels = portal.get("enabled channels", [])
-        if not enabledChannels:
-            continue
+    for portal in portals:
+        if portals[portal]["enabled"] == "true":
+            enabledChannels = portals[portal].get("enabled channels", [])
+            if len(enabledChannels) != 0:
+                name = portals[portal]["name"]
+                url = portals[portal]["url"]
+                macs = list(portals[portal]["macs"].keys())
+                proxy = portals[portal]["proxy"]
+                epgTimeOffset = float(portals[portal]["epgTimeOffset"])
+                time_zone = portals[portal]["time_zone"]
+                customChannelNames = portals[portal].get("custom channel names", {})
+                customEpgIds = portals[portal].get("custom epg ids", {})
 
-        name = portal.get("name")
-        epgTimeOffset = float(portal.get("epgTimeOffset", "0"))
-
-        allChannels, _genres = get_portal_channels_genres(portal_id, portal)
-        epg = get_portal_epg(portal_id, portal, period_hours=24)
-        if not allChannels or not epg:
-            logger.error(f"Error making XMLTV for {name}, skipping")
-            continue
-
-        customChannelNames = portal.get("custom channel names", {})
-        customEpgIds = portal.get("custom epg ids", {})
-
-        for c in allChannels:
-            try:
-                channelId = str(c.get("id"))
-                if channelId not in enabledChannels:
-                    continue
-                channelName = customChannelNames.get(channelId) or str(c.get("name"))
-                epgId = customEpgIds.get(channelId) or (portal_id + channelId)
-                channelEle = ET.SubElement(channels, "channel", id=epgId)
-                ET.SubElement(channelEle, "display-name").text = channelName
-                if c.get("logo"):
-                    ET.SubElement(channelEle, "icon", src=c.get("logo"))
-                for p in epg.get(channelId, []):
+                for mac in macs:
                     try:
-                        start = datetime.fromtimestamp(p.get("start_timestamp", timezone.utc)).strftime("%Y%m%d%H%M%S") + " " + float_to_time_stamp(epgTimeOffset)
-                        stop  = datetime.fromtimestamp(p.get("stop_timestamp", timezone.utc)).strftime("%Y%m%d%H%M%S") + " " + float_to_time_stamp(epgTimeOffset)
-                        programmeEle = ET.SubElement(programmes, "programme", start=start, stop=stop, channel=epgId)
-                        ET.SubElement(programmeEle, "title").text = p.get("name")
-                        ET.SubElement(programmeEle, "desc").text = p.get("descr")
+                        token = stb.getToken(url, mac, proxy, time_zone)
+                        stb.getProfile(url, mac, token, proxy, time_zone)
+                        allChannels = stb.getAllChannels(url, mac, token, proxy, time_zone)
+                        epg = stb.getEpg(url, mac, token, 24, proxy, time_zone)
+                        break
                     except:
-                        pass
-            except:
-                pass
+                        allChannels = None
+                        epg = None
 
-    xmltv_root = channels
+                if allChannels and epg:
+                    for c in allChannels:
+                        try:
+                            channelId = c.get("id")
+                            if str(channelId) in enabledChannels:
+                                channelName = customChannelNames.get(str(channelId))
+                                if channelName == None:
+                                    channelName = str(c.get("name"))
+                                epgId = customEpgIds.get(channelId)
+                                if epgId == None:
+                                    epgId = portal + channelId
+                                channelEle = ET.SubElement(
+                                    channels, "channel", id=epgId
+                                )
+                                ET.SubElement(
+                                    channelEle, "display-name"
+                                ).text = channelName
+                                ET.SubElement(channelEle, "icon", src=c.get("logo"))
+                                for p in epg.get(channelId):
+                                    try:
+                                        start = (
+                                            datetime.utcfromtimestamp(
+                                                p.get("start_timestamp")
+                                            ).strftime("%Y%m%d%H%M%S")
+                                            + " " + float_to_time_stamp(epgTimeOffset)
+                                        )
+                                        stop = (
+                                            datetime.utcfromtimestamp(
+                                                p.get("stop_timestamp")
+                                            ).strftime("%Y%m%d%H%M%S")
+                                            + " " + float_to_time_stamp(epgTimeOffset)
+                                        )
+                                        programmeEle = ET.SubElement(
+                                            programmes,
+                                            "programme",
+                                            start=start,
+                                            stop=stop,
+                                            channel=epgId,
+                                        )
+                                        ET.SubElement(
+                                            programmeEle, "title"
+                                        ).text = p.get("name")
+                                        ET.SubElement(
+                                            programmeEle, "desc"
+                                        ).text = p.get("descr")
+                                    except:
+                                        pass
+                        except:
+                            pass
+                else:
+                    logger.error("Error making XMLTV for {}, skipping".format(name))
+
+    xmltv = channels
     for programme in programmes.iter("programme"):
-        xmltv_root.append(programme)
+        xmltv.append(programme)
 
-    xml_str = ET.tostring(xmltv_root, encoding="unicode", xml_declaration=True)
-    if request.args.get("download") == "1":
-        resp = make_response(xml_str)
-        resp.headers["Content-Type"] = "application/xml"
-        resp.headers["Content-Disposition"] = 'attachment; filename="xmltv.xml"'
-        return resp
-    return Response(xml_str, mimetype="text/xml")
+    return Response(
+        ET.tostring(xmltv, encoding="unicode", xml_declaration=True),
+        mimetype="text/xml",
+    )
 
 
 @app.route("/play/<portalId>/<channelId>", methods=["GET"])
@@ -1608,7 +1483,7 @@ def streaming():
 @app.route("/log")
 @authorise
 def log():
-    with open(LOG_PATH) as f:
+    with open("STB-Proxy.log") as f:
         log = f.read()
     return log
 
@@ -1688,7 +1563,14 @@ def lineup():
                 customChannelNames = portals[portal].get("custom channel names", {})
                 customChannelNumbers = portals[portal].get("custom channel numbers", {})
 
-                allChannels, _genres = get_portal_channels_genres(portal, portals[portal])
+                for mac in macs:
+                    try:
+                        token = stb.getToken(url, mac, proxy, time_zone)
+                        stb.getProfile(url, mac, token, proxy, time_zone)
+                        allChannels = stb.getAllChannels(url, mac, token, proxy, time_zone)
+                        break
+                    except:
+                        allChannels = None
 
                 if allChannels:
                     for channel in allChannels:
@@ -1719,67 +1601,6 @@ def lineup():
     return flask.jsonify(lineup)
 
 
-
-
-@app.route("/playlists", methods=["GET"])
-@authorise
-def playlists_page():
-    """Render the per-portal playlists UI (dropdown viewer)."""
-    return render_template("playlists.html", portals=getActivePortals())
-
-@app.route("/playlist/<portal_id>", methods=["GET"])
-@authorise
-def playlist_portal(portal_id):
-    """Return M3U for a single portal (text/plain)."""
-    portals = getPortals()
-    portal = portals.get(portal_id)
-    if not portal:
-        return make_response("Portal not found", 404)
-    entries = _build_playlist_for_portal(portal_id, portal)
-    playlist = "#EXTM3U\n" + "\n".join(entries)
-    return Response(playlist, mimetype="text/plain")
-
-@app.route("/playlist/<portal_id>.m3u", methods=["GET"])
-@authorise
-def playlist_portal_download(portal_id):
-    """Return M3U as attachment for a single portal."""
-    portals = getPortals()
-    portal = portals.get(portal_id)
-    if not portal:
-        return make_response("Portal not found", 404)
-    entries = _build_playlist_for_portal(portal_id, portal)
-    playlist = "#EXTM3U\n" + "\n".join(entries)
-    resp = make_response(playlist)
-    filename = f"{portal.get('name','portal')}.m3u"
-    resp.headers["Content-Type"] = "audio/x-mpegurl"
-    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-    return resp
-
-@app.route("/playlist.m3u", methods=["GET"])
-@authorise
-def playlist_download_all():
-    """Return aggregated M3U for all enabled portals as attachment."""
-    channels = []
-    portals = getPortals()
-    for portal_id, portal_data in portals.items():
-        if portal_data.get("enabled") != "true":
-            continue
-        if not portal_data.get("enabled channels"):
-            continue
-        channels.extend(_build_playlist_for_portal(portal_id, portal_data))
-
-    playlist_text = "#EXTM3U\n" + "\n".join(channels)
-    resp = make_response(playlist_text)
-    resp.headers["Content-Type"] = "audio/x-mpegurl"
-    resp.headers["Content-Disposition"] = 'attachment; filename="all-portals.m3u"'
-    return resp
-
-@app.route("/xmltv.xml", methods=["GET"])
-@authorise
-def xmltv_download():
-    with app.test_request_context("/xmltv?download=1"):
-        return xmltv()
-
 if __name__ == "__main__":
     config = loadConfig()
     if debugMode or ("TERM_PROGRAM" in os.environ.keys() and os.environ["TERM_PROGRAM"] == "vscode"):
@@ -1791,22 +1612,3 @@ if __name__ == "__main__":
     else:
         # On release use waitress server with multi-threading
         waitress.serve(app, port=8001, _quiet=True, threads=24)
-
-
-
-
-
-
-
-
-# ensure cache dir exists at startup
-try:
-    import os
-    os.makedirs(os.path.join(os.path.dirname(__file__), 'cache'), exist_ok=True)
-except Exception:
-    pass
-
-
-@app.context_processor
-def inject_redirect_flag():
-    return dict(DIRECT_STREAM_REDIRECT=DIRECT_STREAM_REDIRECT)
